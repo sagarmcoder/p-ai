@@ -3,39 +3,32 @@
 
 # app/services/pdf.py
 import io
-
-# Primary: PyMuPDF (fast)
-try:
-    import fitz  # PyMuPDF
-    _HAVE_FITZ = True
-except Exception:
-    _HAVE_FITZ = False
-
+from ..config import settings
+import fitz # PyMuPDF
 # Fallback: pdfminer.six (robust)
-from pdfminer.high_level import extract_text as pdfminer_extract_text
+from pdfminer.high_level import extract_text as pm_extract
 
-def _extract_with_fitz(data: bytes) -> str:
-    # PyMuPDF can segfault on malformed PDFs (native code).
-    # We keep it wrapped to catch Python-side exceptions,
-    # but a native crash will still kill the process.
-    with fitz.open(stream=data, filetype="pdf") as doc:
-        texts = []
-        for page in doc:
-            texts.append(page.get_text("text"))
-        return "\n".join(texts)
-
-def _extract_with_pdfminer(data: bytes) -> str:
-    return pdfminer_extract_text(io.BytesIO(data)) or ""
 
 def extract_text(data: bytes) -> str:
-    # Try fast path first; then fallback to robust parser
-    if _HAVE_FITZ:
+    use_pymupdf = settings.USE_PYMUPDF
+    if use_pymupdf:
         try:
-            txt = _extract_with_fitz(data)
-            if txt and txt.strip():
-                return txt
-        except Exception:
-            # Swallow Python exceptions and try pdfminer
+             # PyMuPDF
+            doc = fitz.open(stream=data, filetype="pdf")
+            # limit pages to avoid pathological files
+            max_pages = int(os.getenv("PDF_MAX_PAGES", "200"))
+            texts = []
+            for i, page in enumerate(doc):
+                if i >= max_pages: break
+                texts.append(page.get_text("text"))
+            return "\n".join(texts)
+        except Exception as e:
+            # fallback below
             pass
-    # Fallback path (handles lots of malformed PDFs)
-    return _extract_with_pdfminer(data)
+
+    # fallback: pdfminer.six (slower but robust)
+    try:
+        #pdfminer
+        return pm_extract(io.BytesIO(data))
+    except Exception as e:
+        raise RuntimeError(f"PDF parse failed: {e}")

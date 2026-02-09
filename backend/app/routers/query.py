@@ -1,37 +1,82 @@
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+# app/routers/query.py
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel, Field
+from typing import List
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+
 from ..db import get_db
 from ..services import embeddings, generator
+from ..services import retriever  # <-- import the module above
 
 router = APIRouter()
 
-class QueryReq(BaseModel):
+MAX_CHARS = 700
+def _trim(txt: str, n: int = MAX_CHARS) -> str:
+    return txt if len(txt) <= n else txt[:n].rsplit(" ", 1)[0] + "…"
+
+# ------------ Models ------------
+
+class QueryIn(BaseModel):
+    question: str = Field(..., min_length=2)
+    top_k: int = Field(4, ge=1, le=20)
+
+class Snippet(BaseModel):
+    title: str
+    seq: int
+    text: str
+
+class QueryOut(BaseModel):
+    answer: str
+    snippets: List[Snippet]
+
+# ------------ Helpers ------------
+
+def _fetch_top_chunks(db: Session, query_vec: List[float], top_k: int) -> List[Snippet]:
+    """
+    Returns a list of Snippet models (title, seq, text) chosen by nearest L2 distance.
+    """
+    rows = retriever.top_k_by_vector(db, query_vec, top_k)
+    return [Snippet(title=r["title"], seq=r["seq"], text=_trim(r["text"])) for r in rows]
+
+# ------------ Routes ------------
+
+@router.post("/query", response_model=QueryOut)
+def query(payload: QueryIn, db: Session = Depends(get_db)):
+    # 1) Embed the question
+    q_vecs = embeddings.embed_texts([payload.question])
+    if not q_vecs or not q_vecs[0]:
+        raise HTTPException(500, "Failed to embed query.")
+    qvec = q_vecs[0]
+
+    # 2) Retrieve top-k chunks
+    snippets = _fetch_top_chunks(db, qvec, payload.top_k)
+    if not snippets:
+        return QueryOut(
+            answer="I don’t have any embedded content yet to answer. Try ingesting a PDF first.",
+            snippets=[]
+        )
+
+    # 3) Format passages for the LLM (title, text, seq)
+    #    Keep it simple: generator expects list[tuple[title, text, idx]]
+    passages = [(s.title, s.text, s.seq) for s in snippets]
+
+    # 4) Call LLM
+    try:
+        ans = generator.generate_answer(payload.question, passages)
+    except Exception as e:
+        raise HTTPException(500, f"LLM generation failed: {e}")
+
+    return QueryOut(answer=ans, snippets=snippets)
+
+
+# useful for debugging retrieval without LLM
+class SearchIn(BaseModel):
     query: str
-    top_k: int = 5
+    top_k: int = 4
 
-@router.post("")
-def query_endpoint(body: QueryReq, db: Session = Depends(get_db)):
-    if not body.query.strip():
-        raise HTTPException(400, "Query is empty.")
-
-    qvec = embeddings.embed_texts([body.query])[0]
-
-    # ANN search using pgvector operator <-> (L2 by default)
-    sql = text("""
-        SELECT c.text, d.title, c.seq
-        FROM embeddings e
-        JOIN chunks c ON c.id = e.chunk_id
-        JOIN documents d ON d.id = c.document_id
-        ORDER BY e.vector <-> :qvec
-        LIMIT :k
-    """)
-    rows = db.execute(sql, {"qvec": qvec, "k": body.top_k}).fetchall()
-    if not rows:
-        raise HTTPException(404, "No context available. Ingest a document first.")
-
-    passages = [(r.title, r.text, r.seq) for r in rows]
-    answer = generator.generate_answer(body.query, passages)
-    citations = [f"{r.title} #{r.seq}" for r in rows]
-    return {"answer": answer, "citations": citations}
+@router.post("/search", response_model=List[Snippet])
+def search_only(payload: SearchIn, db: Session = Depends(get_db)):
+    q_vecs = embeddings.embed_texts([payload.query])
+    if not q_vecs or not q_vecs[0]:
+        raise HTTPException(500, "Failed to embed query.")
+    return _fetch_top_chunks(db, q_vecs[0], payload.top_k)

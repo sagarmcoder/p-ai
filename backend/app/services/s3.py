@@ -26,6 +26,15 @@ def put_fileobj(fileobj, filename: str, mime: str) -> str:
     )
     return f"s3://{settings.S3_BUCKET}/{key}"
 
+
+def put_bytes(filename: str, data: bytes, mime: str) -> str:
+    """
+    Upload raw bytes to S3 and return an s3:// URI.
+    """
+    key = f"raw/{uuid.uuid4()}-{filename}"
+    s3.put_object(Bucket=settings.S3_BUCKET, Key=key, Body=data, ContentType=mime)
+    return f"s3://{settings.S3_BUCKET}/{key}"
+
 def get_bytes(s3_uri: str) -> bytes:
     """
     Read the object bytes back (for parsing).
